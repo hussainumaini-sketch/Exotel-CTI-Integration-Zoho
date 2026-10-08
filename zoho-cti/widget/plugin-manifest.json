@@ -1,0 +1,12 @@
+{
+  "service": "CRM",
+  "cspDomains": {
+    "connect-src": [
+      "https://integrationscore.mum1.exotel.com",
+      "https://*.exotel.com",
+      "wss://*.exotel.com",
+      "https://*.amazonaws.com"
+    ]
+  },
+  "config": []
+}

@@ -1,0 +1,1598 @@
+string standalone.cti_api(Map crmAPIRequest)
+{
+// cti_api: everything the Exotel CTI widget asks the server for.
+//
+// Setup (Zoho CRM > Setup > Developer Hub > Functions):
+//   Name cti_api, category Standalone, one argument: crmAPIRequest (map).
+//   Then REST API > OAuth2 ON. Leave API Key OFF for this one.
+//
+// The widget calls it with ZOHO.CRM.FUNCTIONS.execute, which runs it as the
+// signed-in Zoho user. So zoho.loginuserid is who is calling: an RM can only
+// ever call with their own caller ID, number and SIP line.
+//
+// Exotel settings come from org variables (Setup > Developer Hub > Variables),
+// created by `npm run zoho:cti-setup`.
+//
+// Writes an RM makes to their own CTI Agents record (status, mode, pending
+// disposition) go through the "cti_crm" connection, which the admin
+// authorised, so RMs need no edit rights on that module. Its scopes:
+//   ZohoCRM.users.ALL, ZohoCRM.modules.ALL,
+//   ZohoCRM.settings.variables.ALL, ZohoCRM.settings.fields.ALL
+//
+// A disposition's first level goes in Zoho's own call outcome field on
+// Calls ("Call Result", API name in the cti_outcome_field variable); the
+// second level and the note go in Sub Disposition and Disposition Note.
+
+params = ifnull(crmAPIRequest.get("params"),Map());
+raw = params.get("arguments");
+if(raw == null && crmAPIRequest.get("body") != null)
+{
+	b = crmAPIRequest.get("body").toString();
+	if(b.startsWith("{"))
+	{
+		raw = ifnull(b.toMap().get("arguments"),b);
+	}
+}
+args = Map();
+if(raw != null)
+{
+	args = raw.toString().toMap();
+}
+action = ifnull(args.get("action"),"");
+me = zoho.loginuserid;
+out = Map();
+out.put("ok",false);
+
+sid = zoho.crm.getOrgVariable("exotel_sid");
+sub = zoho.crm.getOrgVariable("exotel_subdomain");
+// Exotel's user and device APIs only answer on the CCM host.
+ccm = ifnull(zoho.crm.getOrgVariable("exotel_ccm"),"ccm-api.in.exotel.com");
+auth = "Basic " + zoho.encryption.base64Encode(zoho.crm.getOrgVariable("exotel_key") + ":" + zoho.crm.getOrgVariable("exotel_token"));
+apiDomain = ifnull(zoho.crm.getOrgVariable("zoho_api_domain"),"https://www.zohoapis.in");
+admins = ifnull(zoho.crm.getOrgVariable("cti_admins"),"").toLowerCase();
+adminList = admins.replaceAll(" ","").toList(",");
+isAdmin = me.equalsIgnoreCase(zoho.adminuserid) || adminList.contains(me.toLowerCase());
+nowMs = zoho.currenttime.toLong();
+outcomeField = ifnull(zoho.crm.getOrgVariable("cti_outcome_field"),"");
+if(outcomeField == "" || outcomeField == "set-me")
+{
+	outcomeField = "Call_Result";
+}
+
+// Dispositions and incoming-call rules, edited on the CTI Admin tab.
+settings = Map();
+rawSettings = ifnull(zoho.crm.getOrgVariable("cti_settings"),"");
+if(rawSettings.startsWith("{"))
+{
+	settings = rawSettings.toMap();
+}
+
+// The caller's own CTI settings (one CTI Agents record per Zoho user). Read
+// through the admin's cti_crm connection: the records belong to the admin,
+// and the org's sharing rules may hide them from the RM's own view.
+agent = null;
+try
+{
+	lookup = invokeurl
+	[
+		url :apiDomain + "/crm/v2.1/CTI_Agents/search?criteria=" + zoho.encryption.urlEncode("(Zoho_Email:equals:" + me + ")")
+		type :GET
+		connection:"cti_crm"
+	];
+	if(lookup.get("data") != null && lookup.get("data").size() > 0)
+	{
+		agent = lookup.get("data").get(0);
+	}
+}
+catch (lookupErr)
+{
+	info "CTI Agents lookup: " + lookupErr;
+}
+if(agent == null)
+{
+	found = zoho.crm.searchRecords("CTI_Agents","(Zoho_Email:equals:" + me + ")");
+	if(found.size() > 0)
+	{
+		agent = found.get(0);
+	}
+}
+
+// An Exotel App token lets the browser register the RM's SIP line. "me" can
+// bring one along, so the line registers without a second round trip.
+sipToken = "";
+sipError = "";
+if(action == "sip_token" || (action == "me" && ifnull(args.get("sip"),"").toString() == "true"))
+{
+	if(agent == null || agent.get("Calling_Enabled") != true || ifnull(agent.get("Exotel_Agent"),"") == "")
+	{
+		sipError = "You have no SIP line yet. Ask your admin to create one.";
+	}
+	else
+	{
+		tb = Map();
+		tb.put("Id",zoho.crm.getOrgVariable("exotel_app_id"));
+		tb.put("Secret",zoho.crm.getOrgVariable("exotel_app_secret"));
+		tb.put("Entity","app");
+		tr = invokeurl
+		[
+			url :zoho.crm.getOrgVariable("exotel_icore") + "/v2/integrations/token"
+			type :POST
+			parameters:tb.toString()
+			headers:{"Content-Type":"application/json"}
+		];
+		if(tr.get("Status") == "Success")
+		{
+			sipToken = tr.get("Data");
+		}
+		else
+		{
+			sipError = "Exotel did not issue a SIP token: " + ifnull(tr.get("Error"),tr.toString());
+		}
+	}
+}
+
+if(action == "me")
+{
+	out.put("ok",true);
+	out.put("email",me);
+	out.put("isAdmin",isAdmin);
+	out.put("settings",settings);
+	out.put("crmUrl",ifnull(zoho.crm.getOrgVariable("zoho_crm_url"),""));
+	phoneUrl = ifnull(zoho.crm.getOrgVariable("cti_phone_url"),"");
+	out.put("phoneUrl",if(phoneUrl.startsWith("https://"),phoneUrl,""));
+	// Where the Call button widget lives: the Phone tab loads its bridge.html
+	// from there. The widget reports it; an upload changes the version in
+	// it, never the host, so only the same host may replace it.
+	appUrl = ifnull(zoho.crm.getOrgVariable("cti_app_url"),"");
+	if(!appUrl.startsWith("https://"))
+	{
+		appUrl = "";
+	}
+	appArg = ifnull(args.get("app"),"").toString();
+	if(appArg != "" && appArg != appUrl && appArg.startsWith("https://") && appArg.contains(".zappsusercontent.") && !appArg.contains("?") && !appArg.contains("#"))
+	{
+		newHost = appArg.getSuffix("https://").getPrefix("/");
+		oldHost = "";
+		if(appUrl != "")
+		{
+			oldHost = appUrl.getSuffix("https://").getPrefix("/");
+		}
+		if(oldHost == "" || newHost == oldHost)
+		{
+			appVars = invokeurl
+			[
+				url :apiDomain + "/crm/v8/settings/variables"
+				type :GET
+				connection:"cti_crm"
+			];
+			appVid = "";
+			for each  av in ifnull(appVars.get("variables"),List())
+			{
+				if(av.get("api_name") == "cti_app_url")
+				{
+					appVid = av.get("id").toString();
+				}
+			}
+			if(appVid != "")
+			{
+				appOne = Map();
+				appOne.put("id",appVid);
+				appOne.put("value",appArg);
+				appList = List();
+				appList.add(appOne);
+				appBody = Map();
+				appBody.put("variables",appList);
+				appResp = invokeurl
+				[
+					url :apiDomain + "/crm/v8/settings/variables"
+					type :PUT
+					parameters:appBody.toString()
+					connection:"cti_crm"
+				];
+				appUrl = appArg;
+			}
+		}
+	}
+	out.put("appUrl",appUrl);
+	if(agent != null)
+	{
+		sipId = ifnull(agent.get("SIP_Id"),"");
+		mode = ifnull(agent.get("Default_Mode"),"");
+		if(mode == "")
+		{
+			mode = if(sipId != "","SIP","Phone");
+		}
+		if(mode == "SIP" && sipId == "")
+		{
+			mode = "Phone";
+		}
+		a = Map();
+		a.put("id",agent.get("id").toString());
+		// On only once the admin has added their number too.
+		callingOn = agent.get("Calling_Enabled") == true && ifnull(agent.get("Personal_Number"),"") != "";
+		a.put("enabled",callingOn);
+		a.put("callerId",ifnull(agent.get("Caller_ID"),""));
+		a.put("personalNumber",ifnull(agent.get("Personal_Number"),""));
+		a.put("mode",mode);
+		inOn = ifnull(agent.get("Incoming_On"),"");
+		if(inOn == "")
+		{
+			inOn = "Desktop";
+		}
+		a.put("incoming",inOn);
+		a.put("sipId",sipId);
+		a.put("zohoUserId",ifnull(agent.get("Zoho_User_Id"),""));
+		out.put("agent",a);
+		if(sipToken != "")
+		{
+			s = Map();
+			s.put("token",sipToken);
+			s.put("userId",agent.get("Exotel_Agent"));
+			out.put("sip",s);
+		}
+		else if(sipError != "")
+		{
+			out.put("sipError",sipError);
+		}
+	}
+	return out.toString();
+}
+
+if(action == "sip_token")
+{
+	if(sipToken == "")
+	{
+		out.put("error",sipError);
+		return out.toString();
+	}
+	out.put("ok",true);
+	out.put("token",sipToken);
+	out.put("userId",agent.get("Exotel_Agent"));
+	return out.toString();
+}
+
+// ---- The device they work on, and how they take calls ----
+// The RM's own to change:
+//   Incoming_On   Desktop / Phone: the device they work on in Zoho
+//   Default_Mode  SIP / Phone ("Number"): how they take every call, in or out
+// Exotel's devices follow the device they work on: the SIP device is ON on
+// the desktop, the phone device on the phone. The other is OFF. A call that
+// goes out on the other one (Settings: outgoing on SIP or Number) turns it
+// on for the call; the CTI puts things back afterwards ("devices"). An admin
+// can re-apply this for anyone (apply_devices).
+target = null;
+upd = Map();
+if(action == "set_mode" || action == "set_incoming" || action == "devices")
+{
+	if(agent == null)
+	{
+		out.put("error","Calling is not set up for you. Ask your admin.");
+		return out.toString();
+	}
+	target = agent;
+	if(action == "set_incoming")
+	{
+		newIn = ifnull(args.get("incoming"),"");
+		if(newIn != "Desktop" && newIn != "Phone")
+		{
+			out.put("error","Unknown choice.");
+			return out.toString();
+		}
+		upd.put("Incoming_On",newIn);
+	}
+	else if(action == "set_mode")
+	{
+		newMode = ifnull(args.get("mode"),"");
+		if(newMode != "SIP" && newMode != "Phone")
+		{
+			out.put("error","Unknown mode.");
+			return out.toString();
+		}
+		if(newMode == "SIP" && ifnull(agent.get("SIP_Id"),"") == "")
+		{
+			out.put("error","You have no SIP line yet. Ask your admin to create one.");
+			return out.toString();
+		}
+		if(newMode == "Phone" && ifnull(agent.get("Personal_Number"),"") == "")
+		{
+			out.put("error","Your phone number is not set. Ask your admin.");
+			return out.toString();
+		}
+		upd.put("Default_Mode",newMode);
+	}
+}
+if(action == "apply_devices")
+{
+	if(!isAdmin)
+	{
+		out.put("error","Only an admin can do that.");
+		return out.toString();
+	}
+	target = zoho.crm.getRecordById("CTI_Agents",ifnull(args.get("id"),"0").toString().toLong());
+	if(target == null || target.get("id") == null)
+	{
+		out.put("error","That CTI record no longer exists.");
+		return out.toString();
+	}
+}
+callMode = "";
+if(action == "call" && agent != null && agent.get("Calling_Enabled") == true)
+{
+	// The device this call goes out on, against the one kept ON.
+	aSip = ifnull(agent.get("SIP_Id"),"");
+	aWay = ifnull(agent.get("Default_Mode"),"");
+	if(aWay == "")
+	{
+		aWay = if(aSip != "","SIP","Phone");
+	}
+	callMode = ifnull(args.get("mode"),aWay);
+	inOn = ifnull(agent.get("Incoming_On"),"");
+	keepOn = if(aSip != "" && inOn != "Phone","SIP","Phone");
+	if(callMode != keepOn)
+	{
+		target = agent;
+	}
+}
+if(target != null && upd.size() > 0)
+{
+	row = Map();
+	row.putAll(upd);
+	row.put("id",target.get("id").toString());
+	rows = List();
+	rows.add(row);
+	body = Map();
+	body.put("data",rows);
+	body.put("trigger",List());
+	saved = invokeurl
+	[
+		url :apiDomain + "/crm/v8/CTI_Agents"
+		type :PUT
+		parameters:body.toString()
+		connection:"cti_crm"
+	];
+	r0 = null;
+	if(saved.get("data") != null && saved.get("data").size() > 0)
+	{
+		r0 = saved.get("data").get(0);
+	}
+	if(r0 == null || r0.get("code") != "SUCCESS")
+	{
+		out.put("error","Couldn't save that in Zoho. Ask your admin to give the cti_crm connection the ZohoCRM.modules.ALL scope. (" + saved.toString() + ")");
+		return out.toString();
+	}
+	for each  k in upd.keys()
+	{
+		target.put(k,upd.get(k));
+	}
+}
+warning = "";
+if(target != null)
+{
+	// The device to keep ON: SIP while they work on the desktop, otherwise
+	// the phone; for a call, the one it goes out on.
+	tIn = ifnull(target.get("Incoming_On"),"");
+	if(tIn == "")
+	{
+		tIn = "Desktop";
+	}
+	tSip = ifnull(target.get("SIP_Id"),"");
+	tMode = if(tSip != "" && tIn == "Desktop","SIP","Phone");
+	if(action == "call")
+	{
+		tMode = callMode;
+	}
+	exoId = ifnull(target.get("Exotel_User_Id"),"");
+	if(exoId != "")
+	{
+		userUrl = "https://" + ccm + "/v2/accounts/" + sid + "/users/" + exoId;
+		u = invokeurl
+		[
+			url :userUrl + "?fields=devices"
+			type :GET
+			headers:{"Authorization":auth}
+		];
+		r1 = u.get("response");
+		if(r1 != null && r1.toString().startsWith("["))
+		{
+			r1 = r1.toString().toJSONList().get(0).toMap();
+		}
+		devs = List();
+		if(r1 != null && r1.get("data") != null)
+		{
+			devs = ifnull(r1.get("data").get("devices"),List());
+		}
+		sipDev = "";
+		telDev = "";
+		for each  d in devs
+		{
+			dm = d.toString().toMap();
+			uri = ifnull(dm.get("contact_uri"),"").toLowerCase();
+			kind = ifnull(dm.get("type"),"").toLowerCase();
+			if(uri.startsWith("sip:") || kind.contains("sip") || kind.contains("voip") || kind.contains("webrtc"))
+			{
+				sipDev = ifnull(dm.get("id"),"").toString();
+			}
+			else if(telDev == "")
+			{
+				telDev = ifnull(dm.get("id"),"").toString();
+			}
+		}
+		want = if(tMode == "SIP",sipDev,telDev);
+		if(devs.size() == 0)
+		{
+			warning = "Exotel has no devices for this agent.";
+		}
+		else if(want == "" && tMode == "SIP")
+		{
+			warning = "Exotel has no SIP device for this agent.";
+		}
+		offBody = Map();
+		offBody.put("available",false);
+		onBody = Map();
+		onBody.put("available",true);
+		// Exotel keeps one device ON at a time: switch the others off first
+		// (only when there is one to keep on).
+		for each  d in devs
+		{
+			dm = d.toString().toMap();
+			did = ifnull(dm.get("id"),"").toString();
+			if(want != "" && ifnull(dm.get("available"),"").toString() == "true" && did != want)
+			{
+				offResp = invokeurl
+				[
+					url :userUrl + "/devices/" + did
+					type :PUT
+					parameters:offBody.toString()
+					headers:{"Authorization":auth,"Content-Type":"application/json"}
+				];
+				if(!offResp.toString().contains("success"))
+				{
+					warning = "Exotel didn't turn off a device: " + offResp.toString();
+				}
+			}
+		}
+		if(want != "")
+		{
+			isOn = false;
+			for each  d in devs
+			{
+				dm = d.toString().toMap();
+				if(ifnull(dm.get("id"),"").toString() == want && ifnull(dm.get("available"),"").toString() == "true")
+				{
+					isOn = true;
+				}
+			}
+			if(!isOn)
+			{
+				onResp = invokeurl
+				[
+					url :userUrl + "/devices/" + want
+					type :PUT
+					parameters:onBody.toString()
+					headers:{"Authorization":auth,"Content-Type":"application/json"}
+				];
+				if(!onResp.toString().contains("success"))
+				{
+					warning = "Exotel didn't turn on the " + if(tMode == "SIP","SIP","phone") + " device: " + onResp.toString();
+				}
+			}
+		}
+	}
+	if(action != "call")
+	{
+		out.put("ok",true);
+		out.put("mode",ifnull(target.get("Default_Mode"),""));
+		out.put("incoming",tIn);
+		if(warning != "")
+		{
+			out.put("warning",warning);
+		}
+		return out.toString();
+	}
+}
+
+// Connect Two Numbers: Exotel rings "From" first (the RM's phone, or their
+// SIP line in the browser), then "To", showing the RM's caller ID.
+if(action == "call")
+{
+	if(agent == null || agent.get("Calling_Enabled") != true)
+	{
+		out.put("error","Calling is not turned on for you. Ask your admin.");
+		return out.toString();
+	}
+	mode = ifnull(args.get("mode"),ifnull(agent.get("Default_Mode"),"Phone"));
+	fromNum = ifnull(agent.get("Personal_Number"),"");
+	if(mode == "SIP")
+	{
+		fromNum = ifnull(agent.get("SIP_Id"),"");
+	}
+	toNum = ifnull(args.get("to"),"").replaceAll("[^0-9+]","");
+	callerId = ifnull(agent.get("Caller_ID"),"");
+	// The caller ID must still be one of the account's ExoPhones (a number
+	// can be released in Exotel): otherwise the first one the account has is
+	// used, and kept on their record.
+	cxResp = invokeurl
+	[
+		url :"https://" + sub + "/v1/Accounts/" + sid + "/IncomingPhoneNumbers.json"
+		type :GET
+		headers:{"Authorization":auth}
+	];
+	cxText = cxResp.toString();
+	cxFirst = "";
+	cxFound = false;
+	cxWant = callerId.replaceAll("[^0-9]","");
+	if(cxWant.length() > 10)
+	{
+		cxWant = cxWant.subString(cxWant.length() - 10,cxWant.length());
+	}
+	if(cxText.startsWith("{"))
+	{
+		cxMap = cxText.toMap();
+		cxJson = ifnull(cxMap.get("IncomingPhoneNumbers"),ifnull(cxMap.get("IncomingPhoneNumber"),"")).toString();
+		// One number comes as an object rather than a list.
+		if(cxJson.startsWith("{"))
+		{
+			cxJson = "[" + cxJson + "]";
+		}
+		if(cxJson.startsWith("["))
+		{
+			cxList = cxJson.toJSONList();
+			for each  cx in cxList
+			{
+				cxm = cx.toMap();
+				if(cxm.get("IncomingPhoneNumber") != null)
+				{
+					cxm = cxm.get("IncomingPhoneNumber").toString().toMap();
+				}
+				cxDigits = ifnull(cxm.get("PhoneNumber"),"").toString().replaceAll("[^0-9]","");
+				if(cxDigits.length() >= 10)
+				{
+					cxDigits = cxDigits.subString(cxDigits.length() - 10,cxDigits.length());
+					if(cxFirst == "")
+					{
+						cxFirst = "0" + cxDigits;
+					}
+					if(cxDigits == cxWant)
+					{
+						cxFound = true;
+					}
+				}
+			}
+		}
+	}
+	cidNote = "";
+	if(!cxFound && cxFirst != "")
+	{
+		if(callerId != "")
+		{
+			cidNote = "Your caller ID " + callerId + " is no longer in Exotel; calls now show " + cxFirst + ".";
+		}
+		callerId = cxFirst;
+		cxRow = Map();
+		cxRow.put("id",agent.get("id").toString());
+		cxRow.put("Caller_ID",cxFirst);
+		cxRows = List();
+		cxRows.add(cxRow);
+		cxBody = Map();
+		cxBody.put("data",cxRows);
+		cxBody.put("trigger",List());
+		cxSaved = invokeurl
+		[
+			url :apiDomain + "/crm/v8/CTI_Agents"
+			type :PUT
+			parameters:cxBody.toString()
+			connection:"cti_crm"
+		];
+	}
+	if(fromNum == "")
+	{
+		out.put("error",if(mode == "SIP","You have no SIP line yet. Ask your admin to create one.","Your phone number is not set. Ask your admin."));
+		return out.toString();
+	}
+	if(callerId == "")
+	{
+		out.put("error","No caller ID is assigned to you. Ask your admin.");
+		return out.toString();
+	}
+	if(toNum.length() < 6)
+	{
+		out.put("error","That number looks incomplete.");
+		return out.toString();
+	}
+	p = Map();
+	p.put("From",fromNum);
+	p.put("To",toNum);
+	p.put("CallerId",callerId);
+	p.put("Record","true");
+	// Each side on its own channel.
+	p.put("RecordingChannels","dual");
+	p.put("StatusCallback",zoho.crm.getOrgVariable("cti_webhook_url"));
+	// "answered" arrives once per leg, so the CTI knows when the customer
+	// picks up; "terminal" logs the call in Zoho.
+	p.put("StatusCallbackEvents[0]","terminal");
+	p.put("StatusCallbackEvents[1]","answered");
+	p.put("StatusCallbackContentType","application/json");
+	// Who placed it and for which record, so the webhook can log it.
+	p.put("CustomField",ifnull(agent.get("Zoho_User_Id"),"") + "," + ifnull(args.get("module"),"") + "," + ifnull(args.get("recordId"),""));
+	resp = invokeurl
+	[
+		url :"https://" + sub + "/v1/Accounts/" + sid + "/Calls/connect.json"
+		type :POST
+		parameters:p
+		headers:{"Authorization":auth}
+	];
+	c = resp.get("Call");
+	if(c == null)
+	{
+		err = resp.get("RestException");
+		msg = resp.toString();
+		if(err != null)
+		{
+			msg = ifnull(err.get("Message"),err.toString());
+		}
+		out.put("error","Exotel refused the call: " + msg);
+		return out.toString();
+	}
+	out.put("ok",true);
+	out.put("sid",c.get("Sid"));
+	out.put("from",fromNum);
+	out.put("callerId",callerId);
+	if(cidNote != "")
+	{
+		warning = (cidNote + " " + warning).trim();
+	}
+	if(warning != "")
+	{
+		out.put("warning",warning);
+	}
+	return out.toString();
+}
+
+// Where a placed call has got to. "legs" counts the legs that have answered
+// (from the "answered" events the webhook keeps in Live_Call): 1 once the RM
+// is on, 2 once the customer is.
+if(action == "status")
+{
+	callSid = ifnull(args.get("sid"),"");
+	// What Exotel's callbacks have said (cti_webhook keeps it in Live_Call):
+	// the legs answered so far and, once over, how it ended. That is ~40 s
+	// ahead of Exotel's own call record.
+	legs = 0;
+	if(agent != null)
+	{
+		live = ifnull(agent.get("Live_Call"),"");
+		if(callSid != "" && live.startsWith(callSid + "|"))
+		{
+			lp = live.toList("|");
+			if(lp.size() > 1)
+			{
+				legs = lp.get(1).toLong();
+			}
+			if(lp.size() >= 7 && lp.get(3) != "-")
+			{
+				out.put("ok",true);
+				out.put("status",lp.get(3));
+				out.put("legs",legs);
+				out.put("talk",lp.get(4).toLong());
+				out.put("leg1",if(lp.get(5) == "-","",lp.get(5)));
+				out.put("leg2",if(lp.get(6) == "-","",lp.get(6)));
+				out.put("recording","");
+				return out.toString();
+			}
+		}
+	}
+	resp = invokeurl
+	[
+		url :"https://" + sub + "/v1/Accounts/" + sid + "/Calls/" + callSid + ".json?details=true"
+		type :GET
+		headers:{"Authorization":auth}
+	];
+	c = resp.get("Call");
+	if(c == null)
+	{
+		out.put("error","Exotel has no record of that call yet.");
+		return out.toString();
+	}
+	d = ifnull(c.get("Details"),Map());
+	out.put("ok",true);
+	out.put("status",ifnull(c.get("Status"),""));
+	out.put("legs",legs);
+	out.put("talk",ifnull(d.get("ConversationDuration"),0));
+	out.put("leg1",ifnull(d.get("Leg1Status"),""));
+	out.put("leg2",ifnull(d.get("Leg2Status"),""));
+	out.put("recording",ifnull(c.get("RecordingUrl"),""));
+	return out.toString();
+}
+
+// The incoming call cti_route last sent to this RM, so the CTI can show who
+// is ringing its SIP line. Last_Routed_Call = sid|from|module|recordId|ms
+if(action == "incoming")
+{
+	out.put("ok",true);
+	if(agent != null)
+	{
+		lr = ifnull(agent.get("Last_Routed_Call"),"").toList("|");
+		if(lr.size() >= 5 && nowMs - lr.get(4).toLong() < 180000)
+		{
+			out.put("sid",lr.get(0));
+			out.put("from",lr.get(1));
+			out.put("module",lr.get(2));
+			out.put("recordId",lr.get(3));
+		}
+	}
+	return out.toString();
+}
+
+// The RM turned the ringing SIP call down on purpose (Decline). Marked on the
+// call cti_route last sent them, so when Exotel asks again it skips their
+// phone and rings the next free person. The CTI waits for this before it
+// hangs up.
+if(action == "decline")
+{
+	out.put("ok",true);
+	if(agent != null)
+	{
+		lrRaw = ifnull(agent.get("Last_Routed_Call"),"");
+		lrAt = "";
+		if(lrRaw.contains("|"))
+		{
+			lrAt = lrRaw.subString(lrRaw.lastIndexOf("|") + 1,lrRaw.length());
+		}
+		if(lrAt.isNumber() && nowMs - lrAt.toLong() < 180000)
+		{
+			dRow = Map();
+			dRow.put("id",agent.get("id").toString());
+			dRow.put("Last_Routed_Call",lrRaw + "|declined");
+			dRows = List();
+			dRows.add(dRow);
+			dBody = Map();
+			dBody.put("data",dRows);
+			dBody.put("trigger",List());
+			dSaved = invokeurl
+			[
+				url :apiDomain + "/crm/v8/CTI_Agents"
+				type :PUT
+				parameters:dBody.toString()
+				connection:"cti_crm"
+			];
+			out.put("marked",dSaved.toString().contains("SUCCESS"));
+		}
+	}
+	return out.toString();
+}
+
+// A disposition for a call. If Exotel hasn't reported the call yet, it waits
+// on the RM's CTI record (Pending_Disposition) and the webhook applies it
+// when it logs the call.
+if(action == "dispose")
+{
+	callSid = ifnull(args.get("sid"),"");
+	disp = ifnull(args.get("disposition"),"").trim();
+	subDisp = ifnull(args.get("sub"),"").trim();
+	note = ifnull(args.get("note"),"").trim();
+	if(callSid == "" || disp == "")
+	{
+		out.put("error","Choose a disposition.");
+		return out.toString();
+	}
+	fields = Map();
+	fields.put(outcomeField,disp);
+	fields.put("Sub_Disposition",subDisp);
+	fields.put("Disposition_Note",note);
+	hits = zoho.crm.searchRecords("Calls","(Exotel_Call_SID:equals:" + callSid + ")");
+	callId = "";
+	if(hits.size() > 0)
+	{
+		callId = hits.get(0).get("id").toString();
+	}
+	else
+	{
+		// Zoho's search can lag a call logged seconds ago; check the newest.
+		for each  rc in zoho.crm.getRecords("Calls",1,20,{"sort_by":"Created_Time","sort_order":"desc"})
+		{
+			if(ifnull(rc.get("Exotel_Call_SID"),"") == callSid)
+			{
+				callId = rc.get("id").toString();
+			}
+		}
+	}
+	module = "Calls";
+	if(callId != "")
+	{
+		fields.put("id",callId);
+	}
+	else
+	{
+		if(agent == null)
+		{
+			out.put("error","Calling is not set up for you. Ask your admin.");
+			return out.toString();
+		}
+		// Keep the five most recent, newest first.
+		waiting = List();
+		pend = Map();
+		pend.put("sid",callSid);
+		pend.put("d",disp);
+		pend.put("s",subDisp);
+		pend.put("n",note);
+		waiting.add(pend);
+		old = ifnull(agent.get("Pending_Disposition"),"");
+		if(old.startsWith("["))
+		{
+			for each  e in old.toJSONList()
+			{
+				em = e.toString().toMap();
+				if(waiting.size() < 5 && ifnull(em.get("sid"),"") != callSid)
+				{
+					waiting.add(em);
+				}
+			}
+		}
+		module = "CTI_Agents";
+		fields = Map();
+		fields.put("id",agent.get("id").toString());
+		fields.put("Pending_Disposition",waiting.toString());
+	}
+	rows = List();
+	rows.add(fields);
+	body = Map();
+	body.put("data",rows);
+	body.put("trigger",List());
+	saved = invokeurl
+	[
+		url :apiDomain + "/crm/v8/" + module
+		type :PUT
+		parameters:body.toString()
+		connection:"cti_crm"
+	];
+	r0 = null;
+	if(saved.get("data") != null && saved.get("data").size() > 0)
+	{
+		r0 = saved.get("data").get(0);
+	}
+	// Call Result refused the value (not in its picklist): keep the
+	// disposition anyway, both levels in Sub Disposition.
+	if(module == "Calls" && (r0 == null || r0.get("code") != "SUCCESS"))
+	{
+		fields.remove(outcomeField);
+		fields.put("Sub_Disposition",disp + " › " + subDisp);
+		rows = List();
+		rows.add(fields);
+		body.put("data",rows);
+		saved = invokeurl
+		[
+			url :apiDomain + "/crm/v8/Calls"
+			type :PUT
+			parameters:body.toString()
+			connection:"cti_crm"
+		];
+		r0 = null;
+		if(saved.get("data") != null && saved.get("data").size() > 0)
+		{
+			r0 = saved.get("data").get(0);
+		}
+		out.put("warning","Call Result doesn't list \"" + disp + "\". Ask your admin to save Dispositions again.");
+	}
+	if(r0 == null || r0.get("code") != "SUCCESS")
+	{
+		out.put("error","Zoho didn't save the disposition: " + saved.toString());
+		return out.toString();
+	}
+	out.put("ok",true);
+	out.put("pending",module == "CTI_Agents");
+	return out.toString();
+}
+
+// The CTI's call log, newest first. An RM gets every call of their own; an
+// admin gets everyone's, or one person's ("agent": a Zoho user id, or "me").
+// With a recordId, every call with that Lead or Contact. Filters: dir
+// (in/out), since (yyyy-MM-dd), kind (missed/todo), disposition, q (name or
+// number). Zoho is read 200 calls a page, up to 5 pages a request; "next" is
+// the page to ask for more from (0 when there is no more).
+if(action == "history")
+{
+	forRecord = ifnull(args.get("recordId"),"").toString();
+	who = ifnull(args.get("agent"),"").toString();
+	everyone = isAdmin && (who == "" || who == "all");
+	dirArg = ifnull(args.get("dir"),"").toString();
+	// yyyy-MM-dd, compared as the number yyyyMMdd.
+	sinceArg = ifnull(args.get("since"),"").toString().replaceAll("[^0-9]","");
+	sinceNum = 0;
+	if(sinceArg.length() == 8)
+	{
+		sinceNum = sinceArg.toLong();
+	}
+	kind = ifnull(args.get("kind"),"").toString();
+	dispArg = ifnull(args.get("disposition"),"").toString();
+	q = ifnull(args.get("q"),"").toString().toLowerCase().trim();
+	qDigits = q.replaceAll("[^0-9]","");
+	limit = ifnull(args.get("limit"),50).toString().toLong();
+	firstPage = ifnull(args.get("page"),1).toString().toLong();
+	if(firstPage < 1)
+	{
+		firstPage = 1;
+	}
+	myId = "";
+	if(agent != null)
+	{
+		myId = ifnull(agent.get("Zoho_User_Id"),"");
+	}
+	rows = List();
+	nextPage = 0;
+	stop = false;
+	for each  i in {0,1,2,3,4}
+	{
+		if(!stop)
+		{
+			pg = firstPage + i;
+			recs = zoho.crm.getRecords("Calls",pg,200,{"sort_by":"Created_Time","sort_order":"desc"});
+			for each  r in recs
+			{
+				csid = ifnull(r.get("Exotel_Call_SID"),"");
+				startAt = ifnull(r.get("Call_Start_Time"),"").toString();
+				// Older than the date asked for: nothing further down is newer.
+				startDay = startAt.replaceAll("[^0-9]","");
+				if(sinceNum > 0 && startDay.length() >= 8 && startDay.subString(0,8).toLong() < sinceNum)
+				{
+					stop = true;
+				}
+				if(csid != "" && !stop)
+				{
+					owner = ifnull(r.get("Owner"),Map());
+					ownerId = ifnull(owner.get("id"),"").toString();
+					mine = ifnull(owner.get("email"),"").equalsIgnoreCase(me) || (myId != "" && ownerId == myId);
+					rid = "";
+					rname = "";
+					rmod = "";
+					what = r.get("What_Id");
+					whoRec = r.get("Who_Id");
+					if(what != null)
+					{
+						rid = ifnull(what.get("id"),"").toString();
+						rname = ifnull(what.get("name"),"");
+						rmod = ifnull(r.get("$se_module"),"Leads");
+					}
+					else if(whoRec != null)
+					{
+						rid = ifnull(whoRec.get("id"),"").toString();
+						rname = ifnull(whoRec.get("name"),"");
+						rmod = "Contacts";
+					}
+					ctype = ifnull(r.get("Call_Type"),"");
+					cstatus = ifnull(r.get("Exotel_Call_Status"),"");
+					dispo = ifnull(r.get(outcomeField),"");
+					subv = ifnull(r.get("Sub_Disposition"),"");
+					// Saved without Call Result: "first › second" in Sub Disposition.
+					if(dispo == "" && subv.contains(" › "))
+					{
+						dispo = subv.getPrefix(" › ");
+						subv = subv.getSuffix(" › ");
+					}
+					cnum = ifnull(r.get("Customer_Phone"),"");
+					keep = false;
+					if(forRecord != "")
+					{
+						keep = rid == forRecord;
+					}
+					else if(everyone)
+					{
+						keep = true;
+					}
+					else if(isAdmin && who != "me")
+					{
+						keep = ownerId == who;
+					}
+					else
+					{
+						keep = mine;
+					}
+					if(keep && dirArg == "out")
+					{
+						keep = ctype == "Outbound";
+					}
+					if(keep && dirArg == "in")
+					{
+						keep = ctype != "Outbound";
+					}
+					if(keep && kind == "missed")
+					{
+						low = cstatus.toLowerCase();
+						keep = ctype == "Missed" || low.contains("missed") || low.contains("no one") || low.contains("hung up");
+					}
+					if(keep && kind == "todo")
+					{
+						keep = dispo == "";
+					}
+					if(keep && dispArg != "")
+					{
+						keep = dispo == dispArg;
+					}
+					if(keep && q != "")
+					{
+						keep = rname.toLowerCase().contains(q) || (qDigits.length() >= 3 && cnum.replaceAll("[^0-9]","").contains(qDigits));
+					}
+					// A whole page counts, so "more" never skips a call; small asks are cut.
+					if(keep && (limit >= 20 || rows.size() < limit))
+					{
+						row = Map();
+						row.put("id",r.get("id").toString());
+						row.put("sid",csid);
+						row.put("subject",ifnull(r.get("Subject"),""));
+						row.put("type",ctype);
+						row.put("status",cstatus);
+						row.put("start",startAt);
+						row.put("duration",ifnull(r.get("Call_Duration"),""));
+						row.put("owner",ifnull(owner.get("name"),""));
+						row.put("mine",mine);
+						row.put("number",cnum);
+						row.put("callerId",ifnull(r.get("Exotel_Number"),""));
+						row.put("disposition",dispo);
+						row.put("sub",subv);
+						row.put("note",ifnull(r.get("Disposition_Note"),""));
+						row.put("description",ifnull(r.get("Description"),""));
+						row.put("name",rname);
+						row.put("recordId",rid);
+						row.put("module",rmod);
+						rows.add(row);
+					}
+				}
+			}
+			nextPage = pg + 1;
+			if(recs.size() < 200 || stop)
+			{
+				stop = true;
+				nextPage = 0;
+			}
+			else if(rows.size() >= limit)
+			{
+				stop = true;
+			}
+		}
+	}
+	out.put("ok",true);
+	out.put("calls",rows);
+	out.put("next",nextPage);
+	// The people an admin can filter by.
+	if(isAdmin && ifnull(args.get("people"),"").toString() == "true")
+	{
+		people = List();
+		for each  pa in zoho.crm.getRecords("CTI_Agents",1,200)
+		{
+			pid = ifnull(pa.get("Zoho_User_Id"),"").toString();
+			if(pid != "")
+			{
+				pm = Map();
+				pm.put("id",pid);
+				pm.put("name",ifnull(pa.get("Name"),ifnull(pa.get("Zoho_Email"),pid)));
+				people.add(pm);
+			}
+		}
+		out.put("people",people);
+	}
+	return out.toString();
+}
+
+// ---- A call's recording, for the CTI's own player ----
+// Exotel's recording links need the account's key, which must never reach a
+// browser, so this fetches the file and hands it over as base64. An RM gets
+// the recordings of their own calls; an admin, anyone's.
+if(action == "recording")
+{
+	rsid = ifnull(args.get("sid"),"").toString().replaceAll("[^A-Za-z0-9]","");
+	if(rsid == "")
+	{
+		out.put("error","No call to play.");
+		return out.toString();
+	}
+	if(!isAdmin)
+	{
+		myRecId = "";
+		if(agent != null)
+		{
+			myRecId = ifnull(agent.get("Zoho_User_Id"),"").toString();
+		}
+		allowed = false;
+		for each  sc in zoho.crm.searchRecords("Calls","(Exotel_Call_SID:equals:" + rsid + ")")
+		{
+			so = ifnull(sc.get("Owner"),Map());
+			if(ifnull(so.get("email"),"").equalsIgnoreCase(me) || (myRecId != "" && ifnull(so.get("id"),"").toString() == myRecId))
+			{
+				allowed = true;
+			}
+		}
+		if(!allowed)
+		{
+			out.put("error","That recording isn't from one of your calls.");
+			return out.toString();
+		}
+	}
+	callInfo = invokeurl
+	[
+		url :"https://" + sub + "/v1/Accounts/" + sid + "/Calls/" + rsid + ".json"
+		type :GET
+		headers:{"Authorization":auth}
+	];
+	recUrl = "";
+	if(callInfo.get("Call") != null)
+	{
+		recUrl = ifnull(callInfo.get("Call").get("RecordingUrl"),"");
+	}
+	if(recUrl == "")
+	{
+		out.put("error","Exotel has no recording for this call.");
+		return out.toString();
+	}
+	audio = invokeurl
+	[
+		url :recUrl
+		type :GET
+		headers:{"Authorization":auth}
+	];
+	out.put("ok",true);
+	out.put("type","audio/mpeg");
+	out.put("data",zoho.encryption.base64Encode(audio));
+	return out.toString();
+}
+
+// ---- Admin only below ----
+if(!isAdmin)
+{
+	out.put("error","Only an admin can do that.");
+	return out.toString();
+}
+
+// Dispositions and incoming-call rules, stored in the cti_settings variable.
+if(action == "save_settings")
+{
+	s = args.get("settings");
+	text = if(s == null,"",s.toString());
+	if(!text.startsWith("{"))
+	{
+		out.put("error","Nothing to save.");
+		return out.toString();
+	}
+	if(text.length() > 1900)
+	{
+		out.put("error","That is more than Zoho can store. Shorten or remove some dispositions.");
+		return out.toString();
+	}
+	vars = invokeurl
+	[
+		url :apiDomain + "/crm/v8/settings/variables"
+		type :GET
+		connection:"cti_crm"
+	];
+	vid = "";
+	for each  v in ifnull(vars.get("variables"),List())
+	{
+		if(v.get("api_name") == "cti_settings")
+		{
+			vid = v.get("id").toString();
+		}
+	}
+	if(vid == "")
+	{
+		out.put("error","Couldn't find the cti_settings variable. Run npm run zoho:cti-setup, and give the cti_crm connection the ZohoCRM.settings.variables.ALL scope. (" + vars.toString() + ")");
+		return out.toString();
+	}
+	one = Map();
+	one.put("id",vid);
+	one.put("value",text);
+	vlist = List();
+	vlist.add(one);
+	body = Map();
+	body.put("variables",vlist);
+	resp = invokeurl
+	[
+		url :apiDomain + "/crm/v8/settings/variables"
+		type :PUT
+		parameters:body.toString()
+		connection:"cti_crm"
+	];
+	r0 = null;
+	if(resp.get("variables") != null && resp.get("variables").size() > 0)
+	{
+		r0 = resp.get("variables").get(0);
+	}
+	if(r0 == null || r0.get("code") != "SUCCESS")
+	{
+		out.put("error","Zoho didn't save the settings: " + resp.toString());
+		return out.toString();
+	}
+	out.put("ok",true);
+	// Call Result's picklist must list every first-level disposition.
+	names = List();
+	for each  d in ifnull(s.get("dispositions"),List())
+	{
+		dn = ifnull(d.toString().toMap().get("name"),"").trim();
+		if(dn != "")
+		{
+			names.add(dn);
+		}
+	}
+	meta = invokeurl
+	[
+		url :apiDomain + "/crm/v8/settings/fields?module=Calls"
+		type :GET
+		connection:"cti_crm"
+	];
+	field = null;
+	for each  f in ifnull(meta.get("fields"),List())
+	{
+		if(f.get("api_name") == outcomeField)
+		{
+			field = f;
+		}
+	}
+	if(field == null)
+	{
+		out.put("warning","Couldn't read Calls > Call Result to add the new dispositions. Give the cti_crm connection the ZohoCRM.settings.fields.ALL scope, or add them to that picklist in Setup.");
+		return out.toString();
+	}
+	have = List();
+	values = List();
+	for each  pv in ifnull(field.get("pick_list_values"),List())
+	{
+		have.add(ifnull(pv.get("actual_value"),pv.get("display_value")).toString().toLowerCase());
+		keepPv = Map();
+		keepPv.put("id",pv.get("id"));
+		keepPv.put("display_value",pv.get("display_value"));
+		keepPv.put("actual_value",pv.get("actual_value"));
+		values.add(keepPv);
+	}
+	added = List();
+	for each  dn in names
+	{
+		if(!have.contains(dn.toLowerCase()))
+		{
+			nv = Map();
+			nv.put("display_value",dn);
+			nv.put("actual_value",dn);
+			values.add(nv);
+			added.add(dn);
+		}
+	}
+	if(added.size() > 0)
+	{
+		fm = Map();
+		fm.put("id",field.get("id").toString());
+		fm.put("pick_list_values",values);
+		flist = List();
+		flist.add(fm);
+		fbody = Map();
+		fbody.put("fields",flist);
+		patched = invokeurl
+		[
+			url :apiDomain + "/crm/v8/settings/fields/" + field.get("id").toString() + "?module=Calls"
+			type :PATCH
+			parameters:fbody.toString()
+			connection:"cti_crm"
+		];
+		if(!patched.toString().contains("SUCCESS"))
+		{
+			out.put("warning","Add " + added.toString(", ") + " to Calls > Call Result in Setup. Zoho said: " + patched.toString());
+		}
+	}
+	return out.toString();
+}
+
+// The account's ExoPhones (virtual numbers), for assigning caller IDs.
+// Exotel answers this on different hosts per account, so each is tried in
+// turn: the API host, the CCM host, then the v1 API.
+if(action == "exophones")
+{
+	nums = List();
+	said = "";
+	epUrls = List();
+	epUrls.add("https://" + sub + "/v2_beta/Accounts/" + sid + "/IncomingPhoneNumbers?page_size=100");
+	epUrls.add("https://" + ccm + "/v2_beta/Accounts/" + sid + "/IncomingPhoneNumbers?page_size=100");
+	epUrls.add("https://" + sub + "/v1/Accounts/" + sid + "/IncomingPhoneNumbers.json");
+	for each  epUrl in epUrls
+	{
+		if(nums.size() == 0)
+		{
+			epResp = invokeurl
+			[
+				url :epUrl
+				type :GET
+				headers:{"Authorization":auth}
+			];
+			epText = epResp.toString();
+			said = if(epText.length() > 200,epText.subString(0,200),epText);
+			if(epText.startsWith("{"))
+			{
+				epMap = epText.toMap();
+				epJson = ifnull(epMap.get("incoming_phone_numbers"),ifnull(epMap.get("IncomingPhoneNumbers"),ifnull(epMap.get("IncomingPhoneNumber"),""))).toString();
+				// v1 gives one number as an object rather than a list.
+				if(epJson.startsWith("{"))
+				{
+					epJson = "[" + epJson + "]";
+				}
+				if(epJson.startsWith("["))
+				{
+					for each  ep in epJson.toJSONList()
+					{
+						em = ep.toMap();
+						e164 = ifnull(em.get("phone_number"),ifnull(em.get("PhoneNumber"),"")).toString();
+						if(e164 != "")
+						{
+							local = e164;
+							if(e164.startsWith("+91"))
+							{
+								local = "0" + e164.subString(3,e164.length());
+							}
+							m = Map();
+							m.put("number",local);
+							m.put("name",ifnull(em.get("friendly_name"),ifnull(em.get("FriendlyName"),local)));
+							nums.add(m);
+						}
+					}
+				}
+			}
+		}
+	}
+	out.put("ok",true);
+	out.put("exophones",nums);
+	if(nums.size() == 0)
+	{
+		out.put("note",said);
+	}
+	return out.toString();
+}
+
+// Create (or adopt) the Exotel WebRTC agent behind someone's SIP line.
+if(action == "provision_sip")
+{
+	email = ifnull(args.get("email"),"").trim();
+	number = ifnull(args.get("number"),"").toString();
+	note = "";
+	icore = zoho.crm.getOrgVariable("exotel_icore");
+	body = Map();
+	body.put("Id",zoho.crm.getOrgVariable("exotel_app_id"));
+	body.put("Secret",zoho.crm.getOrgVariable("exotel_app_secret"));
+	body.put("Entity","app");
+	tok = invokeurl
+	[
+		url :icore + "/v2/integrations/token"
+		type :POST
+		parameters:body.toString()
+		headers:{"Content-Type":"application/json"}
+	];
+	appToken = ifnull(tok.get("Data"),"");
+	look = invokeurl
+	[
+		url :icore + "/v2/integrations/usermapping?user_id=" + zoho.encryption.urlEncode(email)
+		type :GET
+		headers:{"Authorization":appToken,"Content-Type":"application/json"}
+	];
+	data = look.get("Data");
+	numberUser = "";
+	if(data == null)
+	{
+		// Who in this Exotel account already has this email or number: the
+		// account's own admin, say, who stays on PSTN. Exotel keeps one user
+		// per email and one per number ("Device already exists"), and that
+		// user is left as it is: the new line is made as name+sip@ the same
+		// domain, and without the number (SIP only; Zoho still rings the
+		// number itself when calls go to their phone).
+		emailUser = "";
+		numDigits = number.replaceAll("[^0-9]","");
+		if(numDigits.length() > 10)
+		{
+			numDigits = numDigits.subString(numDigits.length() - 10,numDigits.length());
+		}
+		exoUsers = invokeurl
+		[
+			url :"https://" + ccm + "/v2/accounts/" + sid + "/users?fields=devices&limit=200"
+			type :GET
+			headers:{"Authorization":auth}
+		];
+		usersText = ifnull(exoUsers.get("response"),"[]").toString();
+		if(usersText.startsWith("["))
+		{
+			usersList = usersText.toJSONList();
+			for each  ur in usersList
+			{
+				urm = ur.toMap();
+				ud = urm.get("data");
+				if(ud == null)
+				{
+					ud = urm;
+				}
+				udm = ud.toString().toMap();
+				uName = (ifnull(udm.get("first_name"),"") + " " + ifnull(udm.get("last_name"),"")).trim();
+				if(ifnull(udm.get("email"),"").equalsIgnoreCase(email))
+				{
+					emailUser = uName;
+				}
+				devText = ifnull(udm.get("devices"),"[]").toString();
+				if(numDigits.length() >= 10 && devText.startsWith("["))
+				{
+					devList = devText.toJSONList();
+					for each  dv in devList
+					{
+						cu = ifnull(dv.toMap().get("contact_uri"),"").replaceAll("[^0-9]","");
+						if(cu.length() >= 10 && cu.endsWith(numDigits))
+						{
+							numberUser = uName;
+						}
+					}
+				}
+			}
+		}
+		if(emailUser != "" && email.contains("@"))
+		{
+			note = "Their email is already the Exotel user " + emailUser + ", which was left as it is; their SIP line was made as " + email.getPrefix("@") + "+sip@" + email.getSuffix("@") + ".";
+			email = email.getPrefix("@") + "+sip@" + email.getSuffix("@");
+			look = invokeurl
+			[
+				url :icore + "/v2/integrations/usermapping?user_id=" + zoho.encryption.urlEncode(email)
+				type :GET
+				headers:{"Authorization":appToken,"Content-Type":"application/json"}
+			];
+			data = look.get("Data");
+		}
+	}
+	if(data == null)
+	{
+		entry = Map();
+		entry.put("AppUserId",email);
+		entry.put("AppUsername",ifnull(args.get("name"),email));
+		entry.put("Email",email);
+		entry.put("ExotelAccountSid",sid);
+		entry.put("ExotelUserName",ifnull(args.get("name"),email));
+		entry.put("VirtualNumber",ifnull(args.get("callerId"),""));
+		if(number != "" && numberUser == "")
+		{
+			entry.put("AgentNumber",number);
+		}
+		if(number != "" && numberUser != "")
+		{
+			note = (note + " Their number is already the phone of the Exotel user " + numberUser + ", so their line has SIP only in Exotel; Zoho still rings that number for them.").trim();
+		}
+		// Exotel wants a JSON array. A Deluge list's toString() leaves out the
+		// brackets, so they are added here.
+		made = invokeurl
+		[
+			url :icore + "/v2/integrations/usermapping"
+			type :POST
+			parameters:"[" + entry.toString() + "]"
+			headers:{"Authorization":appToken,"Content-Type":"application/json"}
+		];
+		if(made.get("Status") != "Success")
+		{
+			out.put("error","Exotel replied: " + ifnull(made.get("Error"),ifnull(made.get("error"),made.toString())).toString().trim());
+			return out.toString();
+		}
+		look = invokeurl
+		[
+			url :icore + "/v2/integrations/usermapping?user_id=" + zoho.encryption.urlEncode(email)
+			type :GET
+			headers:{"Authorization":appToken,"Content-Type":"application/json"}
+		];
+		data = look.get("Data");
+	}
+	if(data == null)
+	{
+		out.put("error","Exotel did not return the SIP line.");
+		return out.toString();
+	}
+	out.put("ok",true);
+	out.put("sipId",ifnull(data.get("SipId"),""));
+	out.put("exotelUserId",ifnull(data.get("ExotelUserId"),""));
+	out.put("exotelAgent",email);
+	if(note != "")
+	{
+		out.put("note",note);
+	}
+	return out.toString();
+}
+
+// ---- People: a person's mobile is kept in sync with their Zoho user, and
+// removing their calling removes their Exotel agent. Both go through the
+// "cti_crm" connection (scopes listed at the top).
+
+// Name and mobile, kept the same in Zoho and on the Exotel agent. Email is
+// left alone: Zoho and Exotel don't allow changing it once it's in use.
+if(action == "update_user")
+{
+	userId = ifnull(args.get("userId"),"");
+	u = Map();
+	if(args.get("firstName") != null)
+	{
+		u.put("first_name",args.get("firstName"));
+	}
+	if(args.get("lastName") != null)
+	{
+		u.put("last_name",args.get("lastName"));
+	}
+	if(args.get("mobile") != null)
+	{
+		u.put("mobile",args.get("mobile"));
+	}
+	users = List();
+	users.add(u);
+	body = Map();
+	body.put("users",users);
+	resp = invokeurl
+	[
+		url :apiDomain + "/crm/v8/users/" + userId
+		type :PUT
+		parameters:body.toString()
+		connection:"cti_crm"
+	];
+	row = null;
+	if(resp.get("users") != null && resp.get("users").size() > 0)
+	{
+		row = resp.get("users").get(0);
+	}
+	if(row == null || row.get("code") != "SUCCESS")
+	{
+		why = resp.toString();
+		if(row != null)
+		{
+			why = ifnull(row.get("message"),row.toString());
+		}
+		out.put("error","Zoho didn't update the user: " + why);
+		return out.toString();
+	}
+	// Best effort: the Exotel agent's display name (Exotel wants 3 to 20 characters).
+	exoId = ifnull(args.get("exotelUserId"),"");
+	if(exoId != "")
+	{
+		ex = Map();
+		fn = ifnull(args.get("firstName"),"");
+		ln = ifnull(args.get("lastName"),"");
+		if(fn.length() >= 3 && fn.length() <= 20)
+		{
+			ex.put("first_name",fn);
+		}
+		if(ln.length() >= 3 && ln.length() <= 20)
+		{
+			ex.put("last_name",ln);
+		}
+		if(ex.size() > 0)
+		{
+			exResp = invokeurl
+			[
+				url :"https://" + ccm + "/v2/accounts/" + sid + "/users/" + exoId
+				type :PUT
+				parameters:ex.toString()
+				headers:{"Authorization":auth,"Content-Type":"application/json"}
+			];
+			out.put("exotel",exResp.toString());
+		}
+	}
+	out.put("ok",true);
+	return out.toString();
+}
+
+// Removing someone's calling also removes their Exotel agent, so it stops
+// counting as an Exotel user. Their Zoho user is not touched.
+if(action == "remove_line")
+{
+	exoId = ifnull(args.get("exotelUserId"),"");
+	if(exoId == "")
+	{
+		out.put("ok",true);
+		out.put("note","No Exotel agent to remove.");
+		return out.toString();
+	}
+	resp = invokeurl
+	[
+		url :"https://" + ccm + "/v2/accounts/" + sid + "/users/" + exoId
+		type :DELETE
+		headers:{"Authorization":auth}
+	];
+	if(!resp.toString().contains("success"))
+	{
+		out.put("error","Exotel didn't remove the agent: " + resp.toString());
+		return out.toString();
+	}
+	out.put("ok",true);
+	return out.toString();
+}
+
+out.put("error","Unknown action: " + action);
+return out.toString();
+}

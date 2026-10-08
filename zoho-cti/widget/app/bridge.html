@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Phone link</title>
+</head>
+<body>
+  <script>
+    /* Joins a page from another widget (the Phone tab, CTI History) to the
+       Call button widget's BroadcastChannel, which only pages of this origin
+       can open. See "the Phone tab and the Call button" in cti.js. */
+    (function () {
+      "use strict";
+      if (!window.BroadcastChannel || window.parent === window) return;
+      var bc = new BroadcastChannel("exotel-cti");
+      var phoneOf = "";
+      bc.onmessage = function (e) {
+        window.parent.postMessage({ ctiLink: e.data }, "*");
+      };
+      window.addEventListener("message", function (e) {
+        var m = e.source === window.parent && e.data && e.data.ctiLink;
+        if (!m) return;
+        if (m.t === "here" || m.t === "state") phoneOf = m.u || "";
+        bc.postMessage(m);
+      });
+      // The Phone tab closing takes this page with it: say so for it.
+      window.addEventListener("pagehide", function () {
+        if (phoneOf) bc.postMessage({ t: "bye", u: phoneOf });
+      });
+      window.parent.postMessage({ ctiLink: { t: "bridge" } }, "*");
+    })();
+  </script>
+</body>
+</html>

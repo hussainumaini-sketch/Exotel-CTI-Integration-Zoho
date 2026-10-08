@@ -1,0 +1,299 @@
+// cti_route: Exotel's Connect applet asks this who should take an incoming
+// call ("Configure parameters dynamically by providing a URL"), and gets
+// back the SIP line or phone to ring, in the classic applet's format:
+//   {"destination": {"numbers": ["sip:…" or "+91…"]}, "record": true, …}
+//
+// Setup (Zoho CRM > Setup > Developer Hub > Functions):
+//   Name cti_route, category Standalone, one argument: crmAPIRequest (map).
+//   Then REST API > API Key ON. Put that URL in the flow's Connect applet as
+//   the Primary URL, and the same URL with &fallback=1 as the Fallback URL
+//   (phones only, in case Exotel won't take a SIP line).
+//
+// Who gets the call:
+//   1. A caller who is a Lead or Contact goes to its owner, when the owner
+//      can take calls (calling on, with their number in).
+//   2. Anyone else goes to whoever can take calls and was sent one longest
+//      ago (round robin).
+// Each person is rung on the device they work on (Incoming_On):
+//   Desktop  their SIP line (the phone docked in Zoho). When it can't be
+//            reached (Zoho not open), their number rings.
+//   Phone    their own number, as a normal call.
+// A caller Zoho doesn't know becomes a lead of the person rung (unless the
+// admin turned that off, "newLeads"), so their phone can show who is calling
+// and they can fill the lead in.
+// If the person doesn't answer, Exotel asks again (fetch_after_attempt) and
+// the next person in the round robin is rung. Calls from a lead stay with
+// its owner unless the admin turned that off ("ownerOnly").
+// Someone who turns a SIP call down in Zoho (Decline) means it: their phone
+// isn't rung, and the call goes to the next free person, even when they own
+// the caller.
+// An empty answer means nobody is free: the flow's "didn't dial anyone"
+// branch takes over (log it as missed there).
+//
+// Exotel waits 5 seconds for this, so it does as little as it can.
+
+params = ifnull(crmAPIRequest.get("params"),Map());
+callSid = ifnull(params.get("CallSid"),"");
+caller = ifnull(params.get("From"),ifnull(params.get("CallFrom"),""));
+lastStatus = ifnull(params.get("DialCallStatus"),"").toLowerCase();
+lastWhom = ifnull(params.get("DialWhomNumber"),"");
+phonesOnly = ifnull(params.get("fallback"),"").toString() == "1";
+nowMs = zoho.currenttime.toLong();
+
+settings = Map();
+rawSettings = ifnull(zoho.crm.getOrgVariable("cti_settings"),"");
+if(rawSettings.startsWith("{"))
+{
+	settings = rawSettings.toMap();
+}
+ringSecs = ifnull(settings.get("ringSeconds"),25).toString().toLong();
+if(ringSecs < 10)
+{
+	ringSecs = 10;
+}
+if(ringSecs > 60)
+{
+	ringSecs = 60;
+}
+ownerOnly = ifnull(settings.get("ownerOnly"),true).toString() == "true";
+
+// The caller, if Zoho knows them.
+module = "";
+recordId = "";
+ownerId = "";
+callerName = "";
+callerCompany = "";
+num = caller.replaceAll("[^0-9]","");
+if(num.length() > 10)
+{
+	num = num.subString(num.length() - 10,num.length());
+}
+if(num.length() >= 6)
+{
+	// One search per module, every shape the number is usually saved in.
+	crit = "((Phone:equals:" + num + ")or(Mobile:equals:" + num + ")or(Phone:equals:0" + num + ")or(Mobile:equals:0" + num + ")or(Phone:equals:91" + num + ")or(Mobile:equals:91" + num + ")or(Phone:equals:+91" + num + ")or(Mobile:equals:+91" + num + "))";
+	for each  m in {"Leads","Contacts"}
+	{
+		if(recordId == "")
+		{
+			hits = zoho.crm.searchRecords(m,crit);
+			if(hits.size() > 0)
+			{
+				module = m;
+				recordId = hits.get(0).get("id").toString();
+				ownerId = ifnull(hits.get(0).get("Owner").get("id"),"").toString();
+				callerName = ifnull(hits.get(0).get("Full_Name"),"");
+				// The lead made below for this very call (a new caller, rung
+				// once already) still goes round robin.
+				if(callSid != "" && ifnull(hits.get(0).get("Description"),"").contains(callSid))
+				{
+					ownerId = "";
+					callerName = "";
+				}
+				if(m == "Leads")
+				{
+					callerCompany = ifnull(hits.get(0).get("Company"),"");
+				}
+				else if(hits.get(0).get("Account_Name") != null)
+				{
+					callerCompany = ifnull(hits.get(0).get("Account_Name").get("name"),"");
+				}
+			}
+		}
+	}
+}
+
+// Everyone who can take a call now, and what to ring for each.
+pool = List();
+owner = null;
+for each  a in zoho.crm.getRecords("CTI_Agents",1,200)
+{
+	free = a.get("Calling_Enabled") == true && ifnull(a.get("Personal_Number"),"") != "";
+	if(free)
+	{
+		ph = ifnull(a.get("Personal_Number"),"").replaceAll("[^0-9]","");
+		if(ph.length() == 10)
+		{
+			ph = "+91" + ph;
+		}
+		else if(ph.length() == 11 && ph.startsWith("0"))
+		{
+			ph = "+91" + ph.subString(1,11);
+		}
+		else if(ph != "")
+		{
+			ph = "+" + ph;
+		}
+		sip = ifnull(a.get("SIP_Id"),"");
+		if(sip != "" && !sip.startsWith("sip:"))
+		{
+			sip = "sip:" + sip;
+		}
+		// The device they work on: the desktop takes calls on SIP, the phone
+		// on its number.
+		ringOn = ifnull(a.get("Incoming_On"),"");
+		if(ringOn == "")
+		{
+			ringOn = "Desktop";
+		}
+		viaSip = sip != "" && !phonesOnly && ringOn == "Desktop";
+		uri = if(viaSip,sip,ph);
+		if(uri != "")
+		{
+			lr = ifnull(a.get("Last_Routed_Call"),"").toList("|");
+			routedAt = 0;
+			if(lr.size() >= 5)
+			{
+				routedAt = lr.get(4).toLong();
+			}
+			p = Map();
+			p.put("id",a.get("id").toString());
+			p.put("userId",ifnull(a.get("Zoho_User_Id"),"").toString());
+			p.put("uri",uri);
+			p.put("sip",if(viaSip,sip,""));
+			p.put("phone",ph);
+			p.put("email",ifnull(a.get("Zoho_Email"),""));
+			p.put("routedAt",routedAt);
+			// The fallback URL is asked only when Exotel couldn't use the first
+			// answer, so nobody has been rung yet.
+			p.put("tried",lr.size() > 0 && lr.get(0) == callSid && !(phonesOnly && lastStatus == ""));
+			// They declined this call in Zoho (the CTI marks it).
+			lrRaw = ifnull(a.get("Last_Routed_Call"),"");
+			p.put("declined",callSid != "" && lrRaw.startsWith(callSid + "|") && lrRaw.endsWith("|declined"));
+			pool.add(p);
+			if(ownerId != "" && p.get("userId") == ownerId)
+			{
+				owner = p;
+			}
+		}
+	}
+}
+
+pick = null;
+dest = "";
+// Their SIP line just failed, or gave up within seconds (Zoho closed): ring
+// the same person's phone. Not when they declined it.
+dcd = ifnull(params.get("DialCallDuration"),"").toString();
+quick = dcd.isNumber() && dcd.toLong() < 5;
+if(lastWhom != "" && lastStatus != "" && lastStatus != "completed")
+{
+	for each  p in pool
+	{
+		sipUser = p.get("sip").replaceAll("sip:","");
+		moveOn = lastStatus == "failed" || lastStatus == "busy" || (lastStatus == "no-answer" && quick);
+		if(pick == null && moveOn && p.get("tried") == true && p.get("declined") != true && sipUser != "" && lastWhom.contains(sipUser) && p.get("phone") != "")
+		{
+			pick = p;
+			dest = p.get("phone");
+		}
+	}
+}
+if(pick == null)
+{
+	if(owner != null && owner.get("tried") != true)
+	{
+		pick = owner;
+		dest = owner.get("uri");
+	}
+	else if(owner == null || !ownerOnly || owner.get("declined") == true)
+	{
+		// Round robin: whoever was sent a call longest ago, not yet tried.
+		for each  p in pool
+		{
+			if(p.get("tried") != true && (pick == null || p.get("routedAt").toLong() < pick.get("routedAt").toLong()))
+			{
+				pick = p;
+			}
+		}
+		if(pick != null)
+		{
+			dest = pick.get("uri");
+		}
+	}
+}
+
+answer = Map();
+numbers = List();
+// A caller Zoho doesn't know: a new lead of the person rung, so Zoho can
+// tell their phone who is calling (a notification is always about a lead or
+// contact) and they can fill it in. Not on the fallback URL.
+newLeads = ifnull(settings.get("newLeads"),true).toString() != "false";
+if(pick != null && dest != "" && recordId == "" && newLeads && !phonesOnly && num.length() >= 6)
+{
+	lead = Map();
+	lead.put("Last_Name",caller);
+	lead.put("Company","Not known yet");
+	lead.put("Phone",caller);
+	lead.put("Owner",pick.get("userId"));
+	lead.put("Description","Incoming call " + callSid + " from a number not in Zoho.");
+	madeLead = zoho.crm.createRecord("Leads",lead);
+	if(madeLead.get("id") != null)
+	{
+		module = "Leads";
+		recordId = madeLead.get("id").toString();
+		ns = ifnull(zoho.crm.getOrgVariable("cti_signal_namespace"),"");
+		crm = ifnull(zoho.crm.getOrgVariable("zoho_crm_url"),"");
+		if(ns != "" && ns != "set-me")
+		{
+			sig = Map();
+			sig.put("signal_namespace",ns);
+			sig.put("id",recordId);
+			sig.put("subject",caller + " is calling");
+			sig.put("message","*Incoming call* from a new number~br~" + caller);
+			if(crm != "")
+			{
+				link = Map();
+				link.put("type","link");
+				link.put("open_in","tab");
+				link.put("display_name","Open lead");
+				link.put("url",crm + "/tab/Leads/" + recordId);
+				acts = List();
+				acts.add(link);
+				sig.put("actions",acts);
+			}
+			info zoho.crm.raiseSignal(sig);
+		}
+	}
+}
+if(pick != null && dest != "")
+{
+	numbers.add(dest);
+	// Remembered for the round robin, for retries, and for the CTI's popup.
+	zoho.crm.updateRecord("CTI_Agents",pick.get("id").toLong(),{"Last_Routed_Call":callSid + "|" + caller + "|" + module + "|" + recordId + "|" + nowMs});
+}
+dst = Map();
+dst.put("numbers",numbers);
+answer.put("destination",dst);
+answer.put("fetch_after_attempt",true);
+answer.put("record",true);
+answer.put("recording_channels","dual");
+answer.put("max_ringing_duration",ringSecs);
+answer.put("max_conversation_duration",3600);
+// A phone shows only the virtual number, so whoever picks up hears who is
+// calling first: the lead or contact and their company, or the number.
+// Not on the fallback URL: that answer must work even if this part didn't.
+if(dest != "" && !dest.startsWith("sip:") && !phonesOnly)
+{
+	spoken = callerName;
+	if(spoken != "" && callerCompany != "" && callerCompany != callerName)
+	{
+		spoken = spoken + ", " + callerCompany;
+	}
+	if(spoken == "" && num != "")
+	{
+		spoken = "Call from " + num.replaceAll("(.)","$1 ").trim();
+	}
+	if(spoken != "")
+	{
+		play = Map();
+		play.put("playback_to","callee");
+		play.put("type","text");
+		play.put("value",spoken);
+		answer.put("start_call_playback",play);
+	}
+}
+
+response = Map();
+response.put("status_code",200);
+response.put("body",answer.toString());
+return {"crmAPIResponse":response};

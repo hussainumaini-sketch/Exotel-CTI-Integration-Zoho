@@ -1,0 +1,567 @@
+// cti_webhook: Exotel reports calls here, and they are logged in Zoho Calls.
+//
+// Setup (Zoho CRM > Setup > Developer Hub > Functions):
+//   Name cti_webhook, category Standalone, one argument: crmAPIRequest (map).
+//   Then REST API > API Key ON. Copy that URL into:
+//     - the org variable cti_webhook_url (outgoing calls report there), and
+//     - the Passthru steps of the ExoPhone's Exotel flow, with &event=...
+//       added to the URL:
+//         event=incoming   before Programmable Connect (async): pushes a
+//                          "who is calling" notification to the lead's owner
+//         event=connected  after the call is answered
+//         event=missed     when nobody answered or nobody was available
+//
+// What arrives here:
+//   - Connect calls placed by cti_api (JSON body): EventType "answered" once
+//     per leg (kept in the RM's Live_Call, so the CTI knows when the customer
+//     picks up) and EventType "terminal" when the call is over (kept there
+//     too, so the CTI ends the call at once, and logged).
+//   - Passthru steps of the incoming flow (query parameters).
+// For logging, it only trusts the CallSid: the call itself is read back from
+// Exotel with the API keys, so a forged request can't put anything into Zoho.
+//
+// The description carries only the CallSid and the recording link.
+
+params = ifnull(crmAPIRequest.get("params"),Map());
+data = Map();
+data.putAll(params);
+body = crmAPIRequest.get("body");
+if(body != null && body.toString().trim().startsWith("{"))
+{
+	data.putAll(body.toString().toMap());
+}
+callSid = ifnull(data.get("CallSid"),"");
+if(callSid == "")
+{
+	return "no CallSid";
+}
+step = ifnull(data.get("event"),"").toLowerCase();
+eventType = ifnull(data.get("EventType"),"").toLowerCase();
+nowMs = zoho.currenttime.toLong();
+
+// ---- A leg of an outbound call answered ----
+if(eventType == "answered" || eventType == "ringing")
+{
+	if(eventType == "ringing")
+	{
+		return "ignored";
+	}
+	up = 0;
+	legs = ifnull(data.get("Legs"),"").toString();
+	if(legs.startsWith("["))
+	{
+		for each  leg in legs.toJSONList()
+		{
+			st = ifnull(leg.toMap().get("Status"),"").toLowerCase();
+			if(st == "in-progress" || st == "answered" || st == "completed")
+			{
+				up = up + 1;
+			}
+		}
+	}
+	if(up == 0)
+	{
+		up = 1;
+	}
+	userId = "";
+	cf = ifnull(data.get("CustomField"),"").toList(",");
+	if(cf.size() > 0)
+	{
+		userId = cf.get(0);
+	}
+	if(userId != "")
+	{
+		hits = zoho.crm.searchRecords("CTI_Agents","(Zoho_User_Id:equals:" + userId + ")");
+		if(hits.size() > 0)
+		{
+			ag = hits.get(0);
+			live = ifnull(ag.get("Live_Call"),"");
+			if(live.startsWith(callSid + "|"))
+			{
+				// One "answered" per leg: a second one is the customer, whatever
+				// the Legs list says.
+				was = live.toList("|").get(1).toLong();
+				if(was >= up)
+				{
+					up = was + 1;
+				}
+				if(up > 2)
+				{
+					up = 2;
+				}
+			}
+			zoho.crm.updateRecord("CTI_Agents",ag.get("id").toLong(),{"Live_Call":callSid + "|" + up + "|" + nowMs});
+		}
+	}
+	return "legs " + up;
+}
+
+// ---- An outbound call ended: the CTI hears it now ----
+// Exotel's own call record shows the final status only ~40 s later.
+if(eventType == "terminal")
+{
+	tUser = "";
+	tcf = ifnull(data.get("CustomField"),"").toList(",");
+	if(tcf.size() > 0)
+	{
+		tUser = tcf.get(0);
+	}
+	if(tUser != "")
+	{
+		tHits = zoho.crm.searchRecords("CTI_Agents","(Zoho_User_Id:equals:" + tUser + ")");
+		if(tHits.size() > 0)
+		{
+			tl1 = "-";
+			tl2 = "-";
+			tUp = 0;
+			tLegs = ifnull(data.get("Legs"),"").toString();
+			if(tLegs.startsWith("["))
+			{
+				li = 0;
+				for each  leg in tLegs.toJSONList()
+				{
+					li = li + 1;
+					lst = ifnull(leg.toMap().get("Status"),"").toLowerCase();
+					if(lst == "")
+					{
+						lst = "-";
+					}
+					if(li == 1)
+					{
+						tl1 = lst;
+					}
+					if(li == 2)
+					{
+						tl2 = lst;
+					}
+					if(lst == "completed" || lst == "in-progress" || lst == "answered")
+					{
+						tUp = tUp + 1;
+					}
+				}
+			}
+			tStatus = ifnull(data.get("Status"),"").toLowerCase();
+			if(tStatus == "")
+			{
+				tStatus = "-";
+			}
+			tTalk = ifnull(data.get("ConversationDuration"),"0").toString();
+			if(!tTalk.isNumber())
+			{
+				tTalk = "0";
+			}
+			zoho.crm.updateRecord("CTI_Agents",tHits.get(0).get("id").toLong(),{"Live_Call":callSid + "|" + tUp + "|" + nowMs + "|" + tStatus + "|" + tTalk + "|" + tl1 + "|" + tl2});
+		}
+	}
+}
+
+// The other party's number and who they are in Zoho.
+sid = zoho.crm.getOrgVariable("exotel_sid");
+sub = zoho.crm.getOrgVariable("exotel_subdomain");
+auth = "Basic " + zoho.encryption.base64Encode(zoho.crm.getOrgVariable("exotel_key") + ":" + zoho.crm.getOrgVariable("exotel_token"));
+
+// ---- An incoming call is about to ring someone: tell the lead's owner ----
+// Zoho shows the signal in CRM and pushes it to the owner's Zoho CRM app.
+if(step == "incoming")
+{
+	caller = ifnull(data.get("CallFrom"),ifnull(data.get("From"),""));
+	num = caller.replaceAll("[^0-9]","");
+	if(num.length() > 10)
+	{
+		num = num.subString(num.length() - 10,num.length());
+	}
+	ns = ifnull(zoho.crm.getOrgVariable("cti_signal_namespace"),"");
+	if(num.length() < 6 || ns == "" || ns == "set-me")
+	{
+		return "no signal";
+	}
+	module = "";
+	hit = null;
+	// One search per module, every shape the number is usually saved in.
+	crit = "((Phone:equals:" + num + ")or(Mobile:equals:" + num + ")or(Phone:equals:0" + num + ")or(Mobile:equals:0" + num + ")or(Phone:equals:91" + num + ")or(Mobile:equals:91" + num + ")or(Phone:equals:+91" + num + ")or(Mobile:equals:+91" + num + "))";
+	for each  m in {"Leads","Contacts"}
+	{
+		if(hit == null)
+		{
+			hits = zoho.crm.searchRecords(m,crit);
+			if(hits.size() > 0)
+			{
+				hit = hits.get(0);
+				module = m;
+			}
+		}
+	}
+	if(hit == null)
+	{
+		return "unknown caller";
+	}
+	name = ifnull(hit.get("Full_Name"),caller);
+	company = ifnull(hit.get("Company"),"");
+	if(module == "Contacts" && hit.get("Account_Name") != null)
+	{
+		company = ifnull(hit.get("Account_Name").get("name"),"");
+	}
+	// A phone shows the subject first and cuts it short, so it starts with
+	// who is calling.
+	who = name;
+	if(company != "" && company != name)
+	{
+		who = name + " · " + company;
+	}
+	message = "*Incoming call* from " + if(module == "Leads","lead","contact") + " *" + who + "*~br~" + caller;
+	sig = Map();
+	sig.put("signal_namespace",ns);
+	sig.put("id",hit.get("id").toString());
+	sig.put("subject",who + " is calling");
+	sig.put("message",message);
+	crm = ifnull(zoho.crm.getOrgVariable("zoho_crm_url"),"");
+	if(crm != "")
+	{
+		link = Map();
+		link.put("type","link");
+		link.put("open_in","tab");
+		link.put("display_name",if(module == "Leads","Open lead","Open contact"));
+		link.put("url",crm + "/tab/" + module + "/" + hit.get("id").toString());
+		acts = List();
+		acts.add(link);
+		sig.put("actions",acts);
+	}
+	info zoho.crm.raiseSignal(sig);
+	return "notified";
+}
+
+// ---- Log the call ----
+// Exotel can report a call more than once; log it once.
+seen = zoho.crm.searchRecords("Calls","(Exotel_Call_SID:equals:" + callSid + ")");
+if(seen.size() > 0)
+{
+	// A later report can bring the recording the first one didn't have.
+	lateRec = ifnull(data.get("RecordingUrl"),"");
+	oldCall = seen.get(0);
+	oldDesc = ifnull(oldCall.get("Description"),"");
+	if(lateRec != "" && oldDesc.contains("Recording: none"))
+	{
+		zoho.crm.updateRecord("Calls",oldCall.get("id").toLong(),{"Description":oldDesc.replaceAll("Recording: none","Recording: " + lateRec)});
+		try
+		{
+			lateAudio = invokeurl
+			[
+				url :lateRec
+				type :GET
+				headers:{"Authorization":auth}
+			];
+			lateAudio.setFileName("Recording " + callSid + ".mp3");
+			info zoho.crm.attachFile("Calls",oldCall.get("id").toLong(),lateAudio);
+		}
+		catch (lateErr)
+		{
+			info "recording not attached: " + lateErr;
+		}
+	}
+	return "already logged";
+}
+resp = invokeurl
+[
+	url :"https://" + sub + "/v1/Accounts/" + sid + "/Calls/" + callSid + ".json?details=true"
+	type :GET
+	headers:{"Authorization":auth}
+];
+c = resp.get("Call");
+if(c == null)
+{
+	return "unknown call";
+}
+d = ifnull(c.get("Details"),Map());
+inbound = ifnull(c.get("Direction"),"").startsWith("inbound");
+recording = ifnull(data.get("RecordingUrl"),ifnull(c.get("RecordingUrl"),""));
+startTime = ifnull(c.get("StartTime"),zoho.currenttime.toString("yyyy-MM-dd HH:mm:ss"));
+
+module = "";
+recordId = "";
+ownerId = "";
+leadOwner = "";
+name = "";
+
+// The other party's number, as Exotel saw it, and the ExoPhone used.
+other = ifnull(c.get("To"),"");
+exophone = ifnull(c.get("PhoneNumberSid"),"");
+if(inbound)
+{
+	other = ifnull(c.get("From"),ifnull(data.get("CallFrom"),""));
+	exophone = ifnull(c.get("To"),ifnull(data.get("CallTo"),exophone));
+}
+
+if(!inbound)
+{
+	// Placed by cti_api: CustomField = <Zoho user id>,<module>,<record id>
+	parts = ifnull(data.get("CustomField"),"").toList(",");
+	if(parts.size() > 0)
+	{
+		ownerId = parts.get(0);
+	}
+	if(parts.size() > 2 && parts.get(2) != "")
+	{
+		module = parts.get(1);
+		recordId = parts.get(2);
+		r = zoho.crm.getRecordById(module,recordId.toLong());
+		name = ifnull(r.get("Full_Name"),"");
+	}
+}
+
+// No record yet (an incoming call, or a number dialled by hand): find the
+// Lead or Contact by phone, in the shapes numbers are usually saved in.
+if(recordId == "")
+{
+	num = other.replaceAll("[^0-9]","");
+	if(num.length() > 10)
+	{
+		num = num.subString(num.length() - 10,num.length());
+	}
+	crit = "((Phone:equals:" + num + ")or(Mobile:equals:" + num + ")or(Phone:equals:0" + num + ")or(Mobile:equals:0" + num + ")or(Phone:equals:91" + num + ")or(Mobile:equals:91" + num + ")or(Phone:equals:+91" + num + ")or(Mobile:equals:+91" + num + "))";
+	for each  m in {"Leads","Contacts"}
+	{
+		if(recordId == "" && num.length() >= 6)
+		{
+			hits = zoho.crm.searchRecords(m,crit);
+			if(hits.size() > 0)
+			{
+				h = hits.get(0);
+				module = m;
+				recordId = h.get("id").toString();
+				name = ifnull(h.get("Full_Name"),"");
+				leadOwner = ifnull(h.get("Owner").get("id"),"").toString();
+			}
+		}
+	}
+}
+if(name == "")
+{
+	name = other;
+}
+
+// Deluge keeps "\n" as two characters, so the line break is made this way.
+nl = zoho.encryption.urlDecode("%0A");
+call = Map();
+call.put("Call_Start_Time",startTime.replaceAll(" ","T") + "+05:30");
+call.put("Description","CallSid: " + callSid + nl + "Recording: " + if(recording == "","none",recording));
+call.put("Exotel_Call_SID",callSid);
+call.put("Customer_Phone",other);
+call.put("Exotel_Number",exophone);
+
+answered = false;
+talk = 0;
+status = "";
+if(inbound)
+{
+	dialStatus = ifnull(data.get("DialCallStatus"),ifnull(d.get("Leg2Status"),""));
+	whom = ifnull(data.get("DialWhomNumber"),"");
+	answered = dialStatus == "completed";
+	cd = ifnull(d.get("ConversationDuration"),"").toString();
+	if(cd.isNumber())
+	{
+		talk = cd.toLong();
+	}
+	dcd = ifnull(data.get("DialCallDuration"),"").toString();
+	if(dcd.isNumber())
+	{
+		talk = dcd.toLong();
+	}
+	if(answered)
+	{
+		status = "Answered";
+	}
+	else if(whom == "" && (step == "missed" || dialStatus == ""))
+	{
+		status = "No one available";
+	}
+	else if(dialStatus == "canceled")
+	{
+		status = "Caller hung up";
+	}
+	else
+	{
+		status = "Missed call";
+	}
+	// Owner: the RM whose phone or SIP line Exotel rang, else the one
+	// cti_route sent the call to, else the lead's owner.
+	whomDigits = whom.replaceAll("[^0-9]","");
+	for each  a in zoho.crm.getRecords("CTI_Agents",1,200)
+	{
+		sipUser = ifnull(a.get("SIP_Id"),"").replaceAll("sip:","");
+		mine = ifnull(a.get("Personal_Number"),"").replaceAll("[^0-9]","");
+		if(mine.length() > 10)
+		{
+			mine = mine.subString(mine.length() - 10,mine.length());
+		}
+		if(whom != "" && ((sipUser != "" && whom.contains(sipUser)) || (mine.length() == 10 && whomDigits.endsWith(mine))))
+		{
+			ownerId = ifnull(a.get("Zoho_User_Id"),"");
+		}
+		else if(ownerId == "" && ifnull(a.get("Last_Routed_Call"),"").startsWith(callSid + "|"))
+		{
+			ownerId = ifnull(a.get("Zoho_User_Id"),"");
+		}
+	}
+	if(ownerId == "")
+	{
+		ownerId = leadOwner;
+	}
+	call.put("Call_Type",if(answered,"Inbound","Missed"));
+	call.put("Subject",if(answered,"Call from " + name,"Missed call from " + name));
+}
+else
+{
+	cd = ifnull(d.get("ConversationDuration"),"").toString();
+	if(cd.isNumber())
+	{
+		talk = cd.toLong();
+	}
+	leg1 = ifnull(d.get("Leg1Status"),"");
+	leg2 = ifnull(d.get("Leg2Status"),"");
+	answered = talk > 0 || (leg1 == "completed" && leg2 == "completed");
+	if(answered)
+	{
+		status = "Answered";
+	}
+	else if(leg1 != "" && leg1 != "completed")
+	{
+		status = if(leg1 == "busy","Agent busy",if(leg1 == "failed","Agent unreachable",if(leg1 == "canceled","Canceled","Agent unanswered")));
+	}
+	else if(leg2 == "busy")
+	{
+		status = "Customer busy";
+	}
+	else if(leg2 == "failed" || ifnull(c.get("Status"),"") == "failed")
+	{
+		status = "Customer unreachable";
+	}
+	else if(leg2 == "canceled")
+	{
+		status = "Canceled";
+	}
+	else
+	{
+		status = "Customer unanswered";
+	}
+	call.put("Call_Type","Outbound");
+	call.put("Outbound_Call_Status","Completed");
+	call.put("Subject",if(answered,"Call to " + name,"Call to " + name + " · " + status));
+}
+call.put("Exotel_Call_Status",status);
+// Zoho wants mm:ss and refuses zero on an Inbound or Outbound call.
+if(answered || !inbound)
+{
+	if(talk < 1)
+	{
+		talk = 1;
+	}
+	secs = talk % 60;
+	mins = ((talk - secs) / 60).toLong();
+	call.put("Call_Duration",if(mins < 10,"0" + mins,"" + mins) + ":" + if(secs < 10,"0" + secs,"" + secs));
+}
+if(module == "Leads")
+{
+	call.put("What_Id",recordId);
+	call.put("$se_module","Leads");
+}
+else if(module == "Contacts")
+{
+	call.put("Who_Id",recordId);
+}
+if(ownerId != "")
+{
+	call.put("Owner",ownerId);
+}
+made = zoho.crm.createRecord("Calls",call);
+info made;
+newId = ifnull(made.get("id"),"").toString();
+
+// The recording itself goes on the call as an mp3: Exotel's link needs
+// Exotel's login, so it doesn't play from Zoho.
+if(newId != "" && recording != "")
+{
+	try
+	{
+		audio = invokeurl
+		[
+			url :recording
+			type :GET
+			headers:{"Authorization":auth}
+		];
+		audio.setFileName("Recording " + callSid + ".mp3");
+		info zoho.crm.attachFile("Calls",newId.toLong(),audio);
+	}
+	catch (recErr)
+	{
+		info "recording not attached: " + recErr;
+	}
+}
+
+// A disposition the RM saved before Exotel reported the call.
+if(newId != "" && ownerId != "")
+{
+	ags = zoho.crm.searchRecords("CTI_Agents","(Zoho_User_Id:equals:" + ownerId + ")");
+	if(ags.size() > 0)
+	{
+		ag = ags.get(0);
+		pend = ifnull(ag.get("Pending_Disposition"),"");
+		if(pend.contains(callSid))
+		{
+			rest = List();
+			for each  e in pend.toJSONList()
+			{
+				em = e.toString().toMap();
+				if(ifnull(em.get("sid"),"") == callSid)
+				{
+					// The first level goes in Zoho's Call Result.
+					outcomeField = ifnull(zoho.crm.getOrgVariable("cti_outcome_field"),"");
+					if(outcomeField == "" || outcomeField == "set-me")
+					{
+						outcomeField = "Call_Result";
+					}
+					dmap = Map();
+					dmap.put(outcomeField,ifnull(em.get("d"),""));
+					dmap.put("Sub_Disposition",ifnull(em.get("s"),""));
+					dmap.put("Disposition_Note",ifnull(em.get("n"),""));
+					res = zoho.crm.updateRecord("Calls",newId.toLong(),dmap);
+					if(res.get("id") == null)
+					{
+						// Call Result refused the value: both levels go in Sub Disposition.
+						dmap.remove(outcomeField);
+						dmap.put("Sub_Disposition",ifnull(em.get("d"),"") + " › " + ifnull(em.get("s"),""));
+						zoho.crm.updateRecord("Calls",newId.toLong(),dmap);
+					}
+				}
+				else
+				{
+					rest.add(em);
+				}
+			}
+			zoho.crm.updateRecord("CTI_Agents",ag.get("id").toLong(),{"Pending_Disposition":rest.toString()});
+		}
+	}
+}
+
+// A missed call from someone we know becomes a call-back task for its owner.
+if(inbound && !answered && recordId != "")
+{
+	task = Map();
+	task.put("Subject","Call back " + name + " (missed call)");
+	task.put("Due_Date",zoho.currentdate);
+	task.put("Priority","High");
+	if(module == "Leads")
+	{
+		task.put("What_Id",recordId);
+		task.put("$se_module","Leads");
+	}
+	else
+	{
+		task.put("Who_Id",recordId);
+	}
+	if(ownerId != "")
+	{
+		task.put("Owner",ownerId);
+	}
+	info zoho.crm.createRecord("Tasks",task);
+}
+return "logged";

@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CTI Admin</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Lato:wght@400;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="cti.css" />
+</head>
+<body class="admin">
+  <header class="page-head">
+    <h1>Calling</h1>
+    <nav class="page-tabs" id="pageTabs" role="tablist">
+      <button type="button" data-tab="people" class="on" role="tab">People</button>
+      <button type="button" data-tab="dispositions" role="tab">Dispositions</button>
+      <button type="button" data-tab="incoming" role="tab">Incoming calls</button>
+    </nav>
+  </header>
+
+  <div class="notice" id="notice" hidden><span id="noticeText"></span><button type="button" id="noticeBtn" hidden></button></div>
+
+  <!-- People -->
+  <div class="admin-wrap" id="tab-people">
+    <div class="admin-head">
+      <div class="grow" id="summary">Loading…</div>
+      <button type="button" class="btn" id="reload">Reload</button>
+    </div>
+
+    <div class="card table-wrap">
+      <table class="agents">
+        <thead>
+          <tr>
+            <th>Person</th>
+            <th>Calling</th>
+            <th>Caller ID</th>
+            <th>Personal number</th>
+            <th>Works on</th>
+            <th>Outgoing calls</th>
+            <th>SIP line</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+
+  </div>
+
+  <!-- Dispositions -->
+  <div class="admin-wrap" id="tab-dispositions" hidden>
+    <div class="card set-card">
+      <h2>Dispositions</h2>
+      <p class="legend">Saved on each call in Zoho: the disposition in <b>Call Result</b>, the second level in <b>Sub Disposition</b>.</p>
+      <div class="set-row"><label><span class="switch"><input type="checkbox" id="sTwo" /><span></span></span> Second level</label></div>
+      <div class="set-row"><label><span class="switch"><input type="checkbox" id="sReq" /><span></span></span> Required after every call</label></div>
+      <table class="disp-table">
+        <thead><tr><th>Disposition</th><th id="subHead">Sub dispositions (comma separated)</th><th></th></tr></thead>
+        <tbody id="dispRows"></tbody>
+      </table>
+      <div class="form-actions">
+        <button type="button" class="btn" id="dispAdd">Add disposition</button>
+        <span class="grow"></span>
+        <button type="button" class="btn primary" id="dispSave">Save</button>
+        <span class="row-msg" id="dispMsg"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Incoming calls -->
+  <div class="admin-wrap" id="tab-incoming" hidden>
+    <div class="card set-card">
+      <h2>Incoming calls</h2>
+      <div class="set-row">Ring each person for <input class="num-in" id="sRing" type="number" min="10" max="60" step="5" /> seconds</div>
+      <div class="set-row">When a lead's owner misses the call
+        <select class="sel-in" id="sOwner">
+          <option value="true">count it as missed</option>
+          <option value="false">ring the next person</option>
+        </select>
+      </div>
+      <div class="set-row">A caller who isn't in Zoho
+        <select class="sel-in" id="sNew">
+          <option value="true">becomes a new lead</option>
+          <option value="false">stays a number</option>
+        </select>
+      </div>
+      <p class="legend">A caller who is a Lead or Contact rings its owner. Anyone else rings whoever can take calls and has gone longest without one. A new lead belongs to the person rung, and their phone is told who is calling.</p>
+      <div class="form-actions">
+        <button type="button" class="btn primary" id="inSave">Save</button>
+        <span class="row-msg" id="inMsg"></span>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://live.zwidgets.com/js-sdk/1.5/ZohoEmbededAppSDK.min.js"></script>
+  <script src="cti-common.js"></script>
+  <script src="admin.js"></script>
+</body>
+</html>

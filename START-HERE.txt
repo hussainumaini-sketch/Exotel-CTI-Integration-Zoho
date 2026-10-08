@@ -1,0 +1,17 @@
+Exotel calling inside Zoho CRM: setup kit
+
+1. Open Zoho-CTI-Setup-Guide.pdf and follow it from Part I.
+
+2. Or let an AI assistant do it, and type:  Set up the Exotel CTI in my Zoho CRM
+   - Claude Cowork (Claude desktop app): start a Cowork task with this folder.
+   - Claude Code or Codex: open a terminal in this folder, type claude or codex.
+   It first asks for each key, one after the other, then does the work, and
+   shows you where to click (or clicks for you, if it can use your browser).
+
+Ready-made files (no need to build them unless you change something):
+   out/zoho-cti-widget.zip          the phone screens, for Zoho Widgets
+   out/zoho-functions/*.txt         the three Zoho functions, to paste
+   zoho-cti/client-scripts/*.js     the eight docked-phone scripts
+
+Your keys go only into a file named .env in this folder (copy
+.env.example to .env). Never email that file or share screenshots of it.

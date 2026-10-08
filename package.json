@@ -1,0 +1,31 @@
+{
+  "name": "exotel-web-browser-calling",
+  "version": "1.0.0",
+  "description": "Sample website: WebRTC browser dialer integrated with Exotel WebSDK (incoming + outgoing) plus Click-to-Call (Connect Two Numbers).",
+  "main": "server.js",
+  "scripts": {
+    "build:sdk": "node build-sdk.js",
+    "start": "node server.js",
+    "dev": "node server.js",
+    "provision": "node provision.js",
+    "postinstall": "node build-sdk.js",
+    "codes": "node scripts/issue-codes.js",
+    "cred-package": "node scripts/make-cred-package.js",
+    "cred-pdf": "node scripts/make-cred-package.js --format pdf",
+    "generator": "node scripts/make-generator.js",
+    "zoho:auth": "node scripts/zoho-auth.js",
+    "zoho:links": "node scripts/zoho-links.js",
+    "zoho:widget": "node scripts/build-zoho-widget.js",
+    "zoho:cti-setup": "node scripts/zoho-cti-setup.js"
+  },
+  "license": "Apache-2.0",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "@exotel-npm-dev/exotel-ip-calling-crm-websdk": "^1.2.2",
+    "esbuild": "^0.23.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
